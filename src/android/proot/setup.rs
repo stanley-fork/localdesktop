@@ -1,4 +1,4 @@
-use super::process::ArchProcess;
+use super::process::{ArchProcess, SIMULATED_BIND_DIRS, SIMULATED_PROC_FILES};
 use crate::{
     android::{
         app::build::PolarBearBackend,
@@ -20,7 +20,6 @@ use pathdiff::diff_paths;
 use smithay::utils::Clock;
 use std::{
     fs::{self, File},
-    io::ErrorKind,
     io::{Read, Write},
     os::unix::fs::{symlink, PermissionsExt},
     path::Path,
@@ -82,27 +81,61 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
                         ))
                         .pb_expect("Failed to send log message");
 
-                    let response = reqwest::blocking::get(ARCH_FS_ARCHIVE)
-                        .pb_expect("Failed to download Arch Linux FS");
+                    let response = match reqwest::blocking::get(ARCH_FS_ARCHIVE) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            emit_setup_error(
+                                &mpsc_sender,
+                                format!("Failed to download Arch Linux FS: {}. Retrying...", err),
+                            );
+                            continue;
+                        }
+                    };
 
                     let total_size = response.content_length().unwrap_or(0);
-                    let mut file = File::create(&temp_file)
-                        .pb_expect("Failed to create temp file for Arch Linux FS");
+                    let mut file = match File::create(&temp_file) {
+                        Ok(file) => file,
+                        Err(err) => {
+                            emit_setup_error(
+                                &mpsc_sender,
+                                format!(
+                                    "Failed to create temp file for Arch Linux FS: {}. Retrying...",
+                                    err
+                                ),
+                            );
+                            continue;
+                        }
+                    };
 
                     let mut downloaded = 0u64;
                     let mut buffer = [0u8; 8192];
                     let mut reader = response;
                     let mut last_percent = 0;
+                    let mut should_retry_download = false;
 
                     loop {
-                        let n = reader
-                            .read(&mut buffer)
-                            .pb_expect("Failed to read from response");
+                        let n = match reader.read(&mut buffer) {
+                            Ok(n) => n,
+                            Err(err) => {
+                                emit_setup_error(
+                                    &mpsc_sender,
+                                    format!("Failed to read from response: {}. Retrying...", err),
+                                );
+                                should_retry_download = true;
+                                break;
+                            }
+                        };
                         if n == 0 {
                             break;
                         }
-                        file.write_all(&buffer[..n])
-                            .pb_expect("Failed to write to file");
+                        if let Err(err) = file.write_all(&buffer[..n]) {
+                            emit_setup_error(
+                                &mpsc_sender,
+                                format!("Failed to write to file: {}. Retrying...", err),
+                            );
+                            should_retry_download = true;
+                            break;
+                        }
                         downloaded += n as u64;
                         if total_size > 0 {
                             let percent = (downloaded * 100 / total_size).min(100) as u8;
@@ -118,6 +151,11 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
                                 last_percent = percent;
                             }
                         }
+                    }
+
+                    if should_retry_download {
+                        let _ = fs::remove_file(&temp_file);
+                        continue;
                     }
                 }
 
@@ -173,7 +211,13 @@ fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
     let fs_root = Path::new(ARCH_FS_ROOT);
     let mpsc_sender = options.mpsc_sender.clone();
 
-    if !fs_root.join("proc/.version").exists() {
+    let needs_simulated_sysdata = SIMULATED_BIND_DIRS
+        .iter()
+        .map(|path| *path)
+        .chain(SIMULATED_PROC_FILES.iter().map(|(path, _)| *path))
+        .any(|path| !fs_root.join(path).exists());
+
+    if needs_simulated_sysdata {
         return Some(thread::spawn(move || {
             mpsc_sender
                 .send(SetupMessage::Progress(
@@ -182,35 +226,28 @@ fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
                 .pb_expect(&format!("Failed to send log message"));
 
             // Create necessary directories - don't fail if they already exist
-            let _ = fs::create_dir_all(fs_root.join("proc"));
-            let _ = fs::create_dir_all(fs_root.join("sys"));
-            let _ = fs::create_dir_all(fs_root.join("sys/.empty"));
+            for dir in SIMULATED_BIND_DIRS {
+                if dir == "tmp" {
+                    continue;
+                }
+                let _ = fs::create_dir_all(fs_root.join(dir));
+            }
 
             // Set permissions - only try to set permissions if we're on Unix and have the capability
             #[cfg(unix)]
             {
                 // Try to set permissions, but don't fail if we can't
-                let _ =
-                    fs::set_permissions(fs_root.join("proc"), fs::Permissions::from_mode(0o700));
-                let _ = fs::set_permissions(fs_root.join("sys"), fs::Permissions::from_mode(0o700));
-                let _ = fs::set_permissions(
-                    fs_root.join("sys/.empty"),
-                    fs::Permissions::from_mode(0o700),
-                );
+                for dir in SIMULATED_BIND_DIRS {
+                    if dir == "tmp" {
+                        continue;
+                    }
+                    let _ =
+                        fs::set_permissions(fs_root.join(dir), fs::Permissions::from_mode(0o700));
+                }
             }
 
             // Create fake proc files
-            let proc_files = [
-                    ("proc/.loadavg", "0.12 0.07 0.02 2/165 765\n"),
-                    ("proc/.stat", "cpu  1957 0 2877 93280 262 342 254 87 0 0\ncpu0 31 0 226 12027 82 10 4 9 0 0\n"),
-                    ("proc/.uptime", "124.08 932.80\n"),
-                    ("proc/.version", "Linux version 6.2.1 (proot@termux) (gcc (GCC) 12.2.1 20230201, GNU ld (GNU Binutils) 2.40) #1 SMP PREEMPT_DYNAMIC Wed, 01 Mar 2023 00:00:00 +0000\n"),
-                    ("proc/.vmstat", "nr_free_pages 1743136\nnr_zone_inactive_anon 179281\nnr_zone_active_anon 7183\n"),
-                    ("proc/.sysctl_entry_cap_last_cap", "40\n"),
-                    ("proc/.sysctl_inotify_max_user_watches", "4096\n"),
-                ];
-
-            for (path, content) in proc_files {
+            for (path, content) in SIMULATED_PROC_FILES {
                 let _ = fs::write(fs_root.join(path), content)
                     .pb_expect(&format!("Permission denied while writing to {}", path));
             }
@@ -258,11 +295,43 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
 
             ArchProcess::exec_with_panic_on_error("rm -f /var/lib/pacman/db.lck");
             let install_with_stderr = format!("({}) 2>&1", install);
-            ArchProcess::exec(&install_with_stderr).with_log(|it| {
-                mpsc_sender
-                    .send(SetupMessage::Progress(it))
-                    .pb_expect("Failed to send log message");
-            });
+            let mut saw_execve_enosys = false;
+            let install_status = ArchProcess::exec(&install_with_stderr)
+                .with_log(|it| {
+                    if ArchProcess::is_execve_enosys(&it) {
+                        saw_execve_enosys = true;
+                    }
+                    log::info!("Dependency install output: {}", it);
+                    mpsc_sender
+                        .send(SetupMessage::Progress(it))
+                        .pb_expect("Failed to send log message");
+                })
+                .pb_expect("Failed while running desktop dependency install command");
+
+            if !install_status.success() {
+                if saw_execve_enosys && !ArchProcess::no_seccomp_enabled() {
+                    ArchProcess::enable_no_seccomp("dependency install execve ENOSYS");
+                    mpsc_sender
+                        .send(SetupMessage::Progress(
+                            "Detected device PRoot ENOSYS issue, enabling compatibility fallback..."
+                                .to_string(),
+                        ))
+                        .unwrap_or(());
+                }
+                if saw_execve_enosys {
+                    log::warn!(
+                        "PROOT_EXECVE_ENOSYS_DETECTED phase=install_dependencies attempt={} no_seccomp={}",
+                        attempt,
+                        ArchProcess::no_seccomp_enabled()
+                    );
+                }
+                log::warn!(
+                    "Dependency install command exited with status: {:?}, saw_execve_enosys={}, no_seccomp={}",
+                    install_status.code(),
+                    saw_execve_enosys,
+                    ArchProcess::no_seccomp_enabled()
+                );
+            }
 
             if installed() {
                 return;
@@ -278,6 +347,88 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
             }
         }
     }));
+}
+
+fn configure_pacman_for_android(options: &SetupOptions) -> StageOutput {
+    let mpsc_sender = options.mpsc_sender.clone();
+    let fs_root = Path::new(ARCH_FS_ROOT);
+    let pacman_conf_path = fs_root.join("etc/pacman.conf");
+
+    if !pacman_conf_path.exists() {
+        return None;
+    }
+
+    mpsc_sender
+        .send(SetupMessage::Progress(
+            "Configuring pacman for Android runtime...".to_string(),
+        ))
+        .unwrap_or(());
+
+    let content =
+        fs::read_to_string(&pacman_conf_path).pb_expect("Failed to read pacman configuration");
+    let mut changed = false;
+    let mut lines: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+
+        if trimmed.starts_with("DownloadUser") {
+            lines.push(format!("{}# {}", indent, trimmed));
+            changed = true;
+            continue;
+        }
+
+        if trimmed.starts_with("ParallelDownloads") {
+            let desired = format!("{}ParallelDownloads = 1", indent);
+            if line != desired {
+                changed = true;
+            }
+            lines.push(desired);
+            continue;
+        }
+
+        if trimmed.starts_with("SigLevel") {
+            let desired = format!("{}SigLevel = Never", indent);
+            if line != desired {
+                changed = true;
+            }
+            lines.push(desired);
+            continue;
+        }
+
+        if trimmed.starts_with("LocalFileSigLevel") {
+            let desired = format!("{}LocalFileSigLevel = Never", indent);
+            if line != desired {
+                changed = true;
+            }
+            lines.push(desired);
+            continue;
+        }
+
+        lines.push(line.to_string());
+    }
+
+    if changed {
+        let mut updated = lines.join("\n");
+        updated.push('\n');
+        fs::write(&pacman_conf_path, updated)
+            .pb_expect("Failed to update pacman configuration for Android");
+    }
+
+    let sync_dir = fs_root.join("var/lib/pacman/sync");
+    let pkg_cache_dir = fs_root.join("var/cache/pacman/pkg");
+    fs::create_dir_all(&sync_dir).pb_expect("Failed to create pacman sync directory");
+    fs::create_dir_all(&pkg_cache_dir).pb_expect("Failed to create pacman package cache directory");
+
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&sync_dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&pkg_cache_dir, fs::Permissions::from_mode(0o755));
+    }
+
+    None
 }
 
 fn setup_firefox_config(_: &SetupOptions) -> StageOutput {
@@ -776,10 +927,11 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
     let stages: Vec<SetupStage> = vec![
         Box::new(setup_arch_fs),                // Step 1. Setup Arch FS (extract)
         Box::new(simulate_linux_sysdata_stage), // Step 2. Simulate Linux system data
-        Box::new(install_dependencies),         // Step 3. Install dependencies
-        Box::new(setup_firefox_config),         // Step 4. Setup Firefox config
-        Box::new(setup_lxqt_scaling),           // Step 5. Setup LXQt HiDPI scaling
-        Box::new(fix_xkb_symlink),              // Step 6. Fix xkb symlink (last)
+        Box::new(configure_pacman_for_android), // Step 3. Configure pacman for PRoot
+        Box::new(install_dependencies),         // Step 4. Install dependencies
+        Box::new(setup_firefox_config),         // Step 5. Setup Firefox config
+        Box::new(setup_lxqt_scaling),           // Step 6. Setup LXQt HiDPI scaling
+        Box::new(fix_xkb_symlink),              // Step 7. Fix xkb symlink (last)
     ];
 
     let handle_stage_error = |e: Box<dyn std::any::Any + Send>, sender: &Sender<SetupMessage>| {
